@@ -1,0 +1,77 @@
+name: Refresh info board
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Токен GitHub App (чтение всех репо орги)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r src/requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            src/events-cache.json
+            src/commit-stats-cache.json
+          key: caches-${{ github.run_id }}
+          restore-keys: caches-
+
+      - name: Сборка отчёта
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ORG: incption25
+          GH_TEACHER_LOGINS: ${{ vars.GH_TEACHER_LOGINS }}
+        run: python src/labs_review_queue.py --md > report.md
+
+      - name: Сборка сайта
+        run: |
+          grep -q '^# incption25' report.md || {
+            echo "Отчёт пустой/битый — пропускаем деплой"; exit 1;
+          }
+          printf -- '---\nlayout: default\n---\n' | cat - report.md > site/index.md
+
+      - uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./site
+          output: ./_site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
