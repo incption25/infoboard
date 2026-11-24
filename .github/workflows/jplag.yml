@@ -1,0 +1,175 @@
+name: JPlag (сходство решений)
+
+# Тяжёлый прогон: скачивает лаб-ветки приватных студенческих репо, гоняет JPlag
+# и выкладывает на доску ТОЛЬКО сводку (имена, проценты, имена файлов) — исходный
+# код студентов живёт во временном раннере и в репозиторий не попадает. Поэтому
+# workflow не реагирует на pull_request и вообще не исполняет чужой код.
+#
+# Полные отчёты (.jplag: совпавшие фрагменты кода, кластеры, side-by-side) в этом
+# репо не остаются. Они уходят release-ассетами в приватный <orga>/jplag-reports
+
+# Смотреть: открыть https://<orga>.github.io/infoboard/jplag-viewer/ и перетащить
+# на неё lab-NN.jplag из релиза (by-task прогоны: lab-NN-task-XX.jplag).
+# Этот вьювер — статичная сборка ровно из того же jar (site/jplag-viewer/, синхронизировать
+# при смене JPLAG_VERSION): хостовый jplag.github.io не годится — он под старый формат.
+
+# Публикация = коммит src/jplag-summary.json; откат — git revert того коммита.
+# После изменения summary пингуется refresh.yml, инфоборд перерисовывается сразу.
+
+on:
+  schedule:
+    # раз в сутки на всякий случай; cron GitHub'а ненадёжен,
+    # надежный способ — ручной запуск или cron с локальной машины
+    - cron: "3 0 * * *"
+  workflow_dispatch:
+    inputs:
+      labs:
+        description: "Номера лаб через пробел (пусто = все)"
+        required: false
+        default: ""
+      by_task:
+        description: "Раздельно по подзаданиям (NN-) вместо лабы целиком"
+        type: boolean
+        required: false
+        default: false
+      min_sim:
+        description: "Порог похожести для показа пар, % (пусто = 80)"
+        required: false
+        default: ""
+      force:
+        description: "Перескачать ветки даже при свежем кэше"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jplag
+  cancel-in-progress: false
+
+jobs:
+  jplag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Токен GitHub App (чтение студенческих репо, релизы, пинг доски)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: write
+          permission-actions: write
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r src/requirements.txt
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"  # JPlag 6.3.0 собран под Java 25 (class file 69.0)
+
+      - uses: actions/cache@v4
+        with:
+          path: src/tools
+          key: jplag-jar-6.3.0
+
+      - uses: actions/cache@v4
+        with:
+          path: src/jplag-src
+          key: jplag-src-${{ github.run_id }}
+          restore-keys: jplag-src-
+
+      - name: Прогон JPlag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_ORG: ${{ github.repository_owner }}
+        run: |
+          ARGS=()
+          if [ -n "${{ inputs.labs }}" ]; then
+            ARGS+=(--lab ${{ inputs.labs }})
+          fi
+          if [ "${{ inputs.by_task }}" = "true" ]; then
+            ARGS+=(--by-task)
+          fi
+          if [ -n "${{ inputs.min_sim }}" ]; then
+            ARGS+=(--min-sim "${{ inputs.min_sim }}")
+          fi
+          if [ "${{ inputs.force }}" = "true" ]; then
+            ARGS+=(--force)
+          fi
+          echo "аргументы: ${ARGS[*]:-все лабы, целиком, порог 80}"
+          python src/jplag_check.py "${ARGS[@]}"
+
+      - name: Опубликовать summary
+        id: pub
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if git diff --quiet -- src/jplag-summary.json; then
+            echo "summary без изменений"
+            exit 0
+          fi
+          git config user.name "$GITHUB_REPOSITORY_OWNER-bot"
+          git config user.email "bot@$GITHUB_REPOSITORY_OWNER.local"
+          git add src/jplag-summary.json
+          git commit -m "⚖️ jplag: авто-обновление summary"
+
+          git config --unset-all http.https://github.com/.extraheader || true
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Пинг обновления инфоборда
+        if: steps.pub.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$GITHUB_REPOSITORY_OWNER/infoboard/actions/workflows/refresh.yml/dispatches \
+            -d '{"ref":"main"}'
+
+      - name: Отчёты JPlag в приватный jplag-reports
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          cd src/jplag-reports
+          if ! ls lab-*/*.jplag >/dev/null 2>&1; then echo "нет отчётов — пропускаем"; exit 0; fi
+
+          tmp=/tmp/jplag-assets; rm -rf "$tmp"; mkdir -p "$tmp"
+          for f in lab-*/*.jplag; do
+            # lab-01/all.jplag → lab-01.jplag: имя ассета = имя лабы, тянуть без распаковки;
+            # by-task прогоны: lab-01/task-07.jplag → lab-01-task-07.jplag
+            lab=$(basename "$(dirname "$f")")
+            grp=$(basename "$f" .jplag)
+            if [ "$grp" = all ]; then
+              cp "$f" "$tmp/$lab.jplag"
+            else
+              cp "$f" "$tmp/$lab-$grp.jplag"
+            fi
+          done
+
+          du -h "$tmp"/*.jplag
+          gh release create "reports-${{ github.run_number }}" \
+            --repo "$GITHUB_REPOSITORY_OWNER/jplag-reports" \
+            --title "Отчёты JPlag — прогон #${{ github.run_number }}" \
+            --notes "Для просмотра открыть https://$GITHUB_REPOSITORY_OWNER.github.io/infoboard/jplag-viewer/ и перетащить скачанный lab-NN.jplag (by-task: lab-NN-task-XX.jplag)" \
+            "$tmp"/*.jplag
+
+          # накопление не бесконечное: держим последние 10 прогонов (список — от новых к старым)
+          gh release list --repo "$GITHUB_REPOSITORY_OWNER/jplag-reports" --limit 100 --json tagName,createdAt -q 'sort_by(.createdAt) | reverse | .[10:][].tagName' | while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY_OWNER/jplag-reports" --cleanup-tag --yes
+            echo "удалён старый релиз $tag"
+          done
